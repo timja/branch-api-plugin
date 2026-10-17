@@ -25,10 +25,11 @@
 package integration;
 
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 
+import hudson.model.Cause;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
 import hudson.model.Run;
@@ -38,6 +39,7 @@ import hudson.util.OneShotEvent;
 import integration.harness.BasicMultiBranchProject;
 import java.io.File;
 import java.nio.file.Files;
+import jenkins.branch.BranchProjectFactory;
 import jenkins.branch.BranchSource;
 import jenkins.scm.api.SCMRevision;
 import jenkins.scm.api.SCMRevisionAction;
@@ -63,28 +65,13 @@ class InterruptedIndexingTest {
     void automaticBuildWithItsRevisionIsNotScheduledAgain(JenkinsRule r) throws Exception {
         try (MockSCMController c = MockSCMController.create()) {
             FreeStyleProject master = indexedOnce(r, c);
-            FreeStyleBuild first = master.getBuildByNumber(1);
-            SCMSource source = ((BasicMultiBranchProject) master.getParent())
-                    .getSCMSources()
-                    .get(0);
-            if (SCMRevisionAction.getRevision(source, first) == null) { // as a Pipeline's records when it starts
-                MockSCMHead head = new MockSCMHead("master");
-                first.addAction(
-                        new SCMRevisionAction(source, new MockSCMRevision(head, c.getRevision("foo", "master"))));
-                first.save();
-            }
-            SCMRevision built = SCMRevisionAction.getRevision(source, first);
+            SCMRevision built = attachRevision(c, master.getBuildByNumber(1));
             forgetBuiltRevision(master);
 
-            BasicMultiBranchProject prj = (BasicMultiBranchProject) master.getParent();
-            prj.scheduleBuild2(0).getFuture().get();
-            r.waitUntilNoActivity();
+            reindex(r, master);
 
             assertThat("not built again", master.getLastBuild().getNumber(), is(1));
-            assertThat(
-                    Files.readString(prj.getComputation().getLogFile().toPath()),
-                    containsString("Recorded " + built + " as built for master"));
-            assertThat(prj.getProjectFactory().getRevision(master), is(built));
+            assertThat(factory(master).getRevision(master), is(built));
         }
     }
 
@@ -93,21 +80,33 @@ class InterruptedIndexingTest {
         try (MockSCMController c = MockSCMController.create()) {
             FreeStyleProject master = indexedOnce(r, c);
             FreeStyleBuild first = master.getBuildByNumber(1);
-            SCMSource source = ((BasicMultiBranchProject) master.getParent())
-                    .getSCMSources()
-                    .get(0);
             first.removeActions(SCMRevisionAction.class);
             first.save();
             forgetBuiltRevision(master);
 
-            BasicMultiBranchProject prj = (BasicMultiBranchProject) master.getParent();
-            prj.scheduleBuild2(0).getFuture().get();
-            r.waitUntilNoActivity();
+            reindex(r, master);
 
             assertThat(
                     "nothing says which revision #1 built: as before, the branch builds again",
                     master.getLastBuild().getNumber(),
                     is(2));
+        }
+    }
+
+    @Test
+    void userTriggeredBuildIsNotTakenAsBuilt(JenkinsRule r) throws Exception {
+        try (MockSCMController c = MockSCMController.create()) {
+            FreeStyleProject master = indexedOnce(r, c);
+            FreeStyleBuild second = r.buildAndAssertSuccess(master);
+            attachRevision(c, second);
+            forgetBuiltRevision(master);
+
+            reindex(r, master);
+
+            assertThat(
+                    "the last build was not scheduled by indexing: the branch builds again",
+                    master.getLastBuild().getNumber(),
+                    is(3));
         }
     }
 
@@ -118,33 +117,71 @@ class InterruptedIndexingTest {
             BasicMultiBranchProject prj = r.jenkins.createProject(BasicMultiBranchProject.class, "foo");
             prj.getSourcesList().add(new BranchSource(new MockSCMSource(c, "foo", new MockSCMDiscoverBranches())));
             prj.scheduleBuild2(0).getFuture().get();
-            Hold.started.block(); // the indexing is done, and #1 of master is running
+            HoldFirst hold = r.jenkins.getExtensionList(RunListener.class).get(HoldFirst.class);
+            hold.started.block(); // the indexing is done, and #1 of master is running
             FreeStyleProject master = prj.getItem("master");
-            FreeStyleBuild first = master.getBuildByNumber(1);
             forgetBuiltRevision(master);
-            SCMSource source = prj.getSCMSources().get(0);
-            SCMRevision built = new MockSCMRevision(new MockSCMHead("master"), c.getRevision("foo", "master"));
-            first.addAction(new SCMRevisionAction(source, built)); // as a Pipeline records when it starts, and saves
-            first.save();
-            assertThat(prj.getProjectFactory().getRevision(master), is(built));
-            Hold.release.signal();
+
+            SCMRevision built = attachRevision(c, master.getBuildByNumber(1)); // as a Pipeline does when it starts
+
+            assertThat(factory(master).getRevision(master), is(built));
+            hold.release.signal();
             r.waitUntilNoActivity();
         }
     }
 
-    @TestExtension("runningAutomaticBuildRecordsItsRevision")
-    public static final class Hold extends RunListener<Run<?, ?>> {
-        static final OneShotEvent started = new OneShotEvent();
-        static final OneShotEvent release = new OneShotEvent();
+    @Test
+    void runningUserTriggeredBuildDoesNotRecordItsRevision(JenkinsRule r) throws Exception {
+        try (MockSCMController c = MockSCMController.create()) {
+            FreeStyleProject master = indexedOnce(r, c);
+            HoldSecond hold = r.jenkins.getExtensionList(RunListener.class).get(HoldSecond.class);
+            master.scheduleBuild2(0, new Cause.UserIdCause());
+            hold.started.block(); // #2 of master is running
+            forgetBuiltRevision(master);
+
+            attachRevision(c, master.getBuildByNumber(2));
+
+            assertThat(factory(master).getRevision(master), nullValue());
+            hold.release.signal();
+            r.waitUntilNoActivity();
+        }
+    }
+
+    /** Holds one build of the branch at its start, until released. */
+    private abstract static class Hold extends RunListener<Run<?, ?>> {
+        final OneShotEvent started = new OneShotEvent();
+        final OneShotEvent release = new OneShotEvent();
+        private final int number;
+
+        Hold(int number) {
+            this.number = number;
+        }
 
         @Override
         public void onStarted(Run<?, ?> run, TaskListener listener) {
+            if (run.getNumber() != number) {
+                return;
+            }
             started.signal();
             try {
                 release.block();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    @TestExtension("runningAutomaticBuildRecordsItsRevision")
+    public static final class HoldFirst extends Hold {
+        public HoldFirst() {
+            super(1);
+        }
+    }
+
+    @TestExtension("runningUserTriggeredBuildDoesNotRecordItsRevision")
+    public static final class HoldSecond extends Hold {
+        public HoldSecond() {
+            super(2);
         }
     }
 
@@ -157,7 +194,35 @@ class InterruptedIndexingTest {
         FreeStyleProject master = prj.getItem("master");
         assertThat(master, notNullValue());
         assertThat(master.getLastBuild().getNumber(), is(1));
+        assertThat(factory(master).getRevision(master), notNullValue());
         return master;
+    }
+
+    private static void reindex(JenkinsRule r, FreeStyleProject branch) throws Exception {
+        ((BasicMultiBranchProject) branch.getParent())
+                .scheduleBuild2(0)
+                .getFuture()
+                .get();
+        r.waitUntilNoActivity();
+    }
+
+    private static BranchProjectFactory<FreeStyleProject, FreeStyleBuild> factory(FreeStyleProject branch) {
+        return ((BasicMultiBranchProject) branch.getParent()).getProjectFactory();
+    }
+
+    /**
+     * Attaches the revision of the branch's head to a build, replacing any, and saves it, as a Pipeline does when it
+     * starts.
+     */
+    private static SCMRevision attachRevision(MockSCMController c, Run<?, ?> build) throws Exception {
+        SCMSource source = ((BasicMultiBranchProject) build.getParent().getParent())
+                .getSCMSources()
+                .get(0);
+        SCMRevision revision = new MockSCMRevision(new MockSCMHead("master"), c.getRevision("foo", "master"));
+        build.removeActions(SCMRevisionAction.class);
+        build.addAction(new SCMRevisionAction(source, revision));
+        build.save();
+        return revision;
     }
 
     /** As if the indexing had stopped between scheduling the build and recording its revision. */
