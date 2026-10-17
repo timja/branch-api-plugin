@@ -95,6 +95,7 @@ import jenkins.scm.api.SCMHeadEvent;
 import jenkins.scm.api.SCMHeadMigration;
 import jenkins.scm.api.SCMHeadObserver;
 import jenkins.scm.api.SCMRevision;
+import jenkins.scm.api.SCMRevisionAction;
 import jenkins.scm.api.SCMSource;
 import jenkins.scm.api.SCMSourceCriteria;
 import jenkins.scm.api.SCMSourceEvent;
@@ -2098,6 +2099,9 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
             } else {
                 // get the previous revision
                 SCMRevision scmLastBuiltRevision = _factory.getRevision(project);
+                if (scmLastBuiltRevision == null) {
+                    scmLastBuiltRevision = revisionOfAutomaticBuild(project);
+                }
 
                 if (changesDetected(revision, project, scmLastBuiltRevision)) {
                     listener.getLogger()
@@ -2121,6 +2125,25 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
             } catch (IOException e) {
                 printStackTrace(e, listener.error("Could not save changes to " + rawName));
             }
+        }
+
+        /**
+         * The revision the last build of a branch already has, when that build was scheduled by indexing or an event
+         * and no revision is recorded as built: the indexing that scheduled it stopped before recording its revision
+         * (its controller died, or saving failed). Taking it as the built revision keeps this indexing from building
+         * the branch again for a revision a build already exists for.
+         */
+        @CheckForNull
+        private SCMRevision revisionOfAutomaticBuild(@NonNull P project) {
+            Run<?, ?> build = project.getLastBuild();
+            if (build == null || !isAutomatic(build)) {
+                return null;
+            }
+            SCMRevision revision = SCMRevisionAction.getRevision(source, build);
+            if (revision != null) {
+                recordBuiltRevision(_factory, project, revision, build, listener);
+            }
+            return revision;
         }
 
         private void observeNew(@NonNull SCMHead head, @NonNull SCMRevision revision, @NonNull Branch branch, String rawName, String encodedName, Action[] revisionActions) {
@@ -2461,6 +2484,85 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
          */
         public final XmlFile getStateFile() {
             return new XmlFile(Items.XSTREAM, new File(owner.getRootDir(), "state.xml"));
+        }
+    }
+
+    /** Whether a branch build was scheduled by indexing or by an event, rather than by a user or another trigger. */
+    private static boolean isAutomatic(@NonNull Run<?, ?> build) {
+        return build.getCause(BranchIndexingCause.class) != null || build.getCause(BranchEventCause.class) != null;
+    }
+
+    /**
+     * Records {@code revision} as the revision {@code project} was last built for, because {@code build} already builds
+     * it.
+     *
+     * @param listener the indexing log to report to, if any.
+     */
+    private static <P extends Job<P, R> & TopLevelItem, R extends Run<P, R>> void recordBuiltRevision(
+            @NonNull BranchProjectFactory<P, R> factory,
+            @NonNull P project,
+            @NonNull SCMRevision revision,
+            @NonNull Run<?, ?> build,
+            @CheckForNull TaskListener listener) {
+        try {
+            factory.setRevisionHash(project, revision);
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Could not record the revision built by " + build, e);
+            if (listener != null) {
+                printStackTrace(e, listener.error("Could not update last revision hash"));
+            }
+            return;
+        }
+        LOGGER.log(Level.FINE, "Recorded {0} as built for {1}, by {2}", new Object[] {
+            revision, project.getFullName(), build
+        });
+        if (listener != null) {
+            listener.getLogger()
+                    .format(
+                            "Recorded %s as built for %s, by %s%n",
+                            revision, project.getDisplayName(), build.getFullDisplayName());
+        }
+    }
+
+    /**
+     * Records the revision a running build of a branch builds, once it is known (a Pipeline attaches it when it
+     * starts), if the build was scheduled by indexing or an event and no revision is recorded as built yet: the
+     * indexing that scheduled the build stopped before recording it (its controller died, or saving failed), and the
+     * next indexing would otherwise build the branch again.
+     *
+     * <p>This runs on every save of every build, so everything before the revision is known to be missing is either
+     * in memory or a single file existence check.
+     */
+    @Extension
+    @Restricted(NoExternalUse.class)
+    public static class AutomaticBuildRevisionRecorder extends SaveableListener {
+        @Override
+        public void onChange(Saveable o, XmlFile file) {
+            if (o instanceof Run<?, ?> build
+                    && build.isBuilding()
+                    && build.getAction(SCMRevisionAction.class) != null
+                    && build.getParent().getParent() instanceof MultiBranchProject<?, ?> owner
+                    && isAutomatic(build)) {
+                record(owner, build);
+            }
+        }
+
+        private static <P extends Job<P, R> & TopLevelItem, R extends Run<P, R>> void record(
+                MultiBranchProject<P, R> owner, Run<?, ?> build) {
+            BranchProjectFactory<P, R> factory = owner.getProjectFactory();
+            if (!factory.isProject(build.getParent())) {
+                return;
+            }
+            P project = factory.asProject(build.getParent());
+            if (new File(project.getRootDir(), "scm-revision-hash.xml").exists()) {
+                return; // already recorded: the common case, without reading the file
+            }
+            SCMSource source = owner.getSCMSource(factory.getBranch(project).getSourceId());
+            SCMRevision revision = source == null ? null : SCMRevisionAction.getRevision(source, build);
+            if (revision == null || factory.getRevision(project) != null) {
+                return;
+            }
+            recordBuiltRevision(factory, project, revision, build, null);
         }
     }
 
